@@ -49,17 +49,73 @@ args = parser.parse_args()
 
 histfile = FileHistory(path.expanduser(args.history))
 
-async def select_callback(mythic_instance):
+async def select_callback(mythic_instance, columns):
     ait = await mythic.get_all_active_callbacks(mythic_instance, "id host user os architecture description payload { payloadtype { name } } last_checkin")
-    print("ID  | payload              |       user@host       | Last Seen         | arch   | os                                                 | description")
+    agentlist = []
+    colwidth = [0,7,4,4,9,4,2,4]
     for item in ait:
-        print(item['last_checkin'])
         d = datetime.now() - datetime.fromisoformat(item['last_checkin'][:19])
         if d.total_seconds() < 300:
             d = f"{d.total_seconds()}s"
         else:
-            d = str(d)[:17]
-        print(f"{item['id']:<3} | {item['payload']['payloadtype']['name']:<20} | {item['user'][:10]:>10}@{item['host'][:10]:<10} | {d:<17} | {item['architecture']:<6} | {item['os'][:50]:<50} | {item['description']}")
+            hours, remainder = divmod(d.total_seconds(), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            d = '{}h {}m {}s'.format(int(hours), int(minutes), int(seconds))
+
+        agentlist.append({
+            'id': str(item['id']),
+            'agent': item['payload']['payloadtype']['name'],
+            'user': item['user'],
+            'host': item['host'],
+            'date': d,
+            'arch': item['architecture'],
+            'os': item['os'],
+            'desc': item['description'],
+        })
+        for i,c in enumerate(agentlist[-1].values()):
+            if len(c) > colwidth[i]:
+                colwidth[i] = len(c)
+    w = sum(colwidth)+6*3
+    if w > columns:
+        #make stuff smaller
+        if colwidth[6] > 13:
+            w -= colwidth[6] - 13
+            colwidth[6] = 13
+        if w > columns:
+            colwidth[7] -= 1+w-columns
+
+    form = []
+    i = 0
+    for c in ('#','payload','user@host','Last Seen','arch','os','desc'):
+        if i > 0:
+            form.append(('',' | '))
+        if i==2:
+            c = 'user'.rjust(colwidth[2])+'@'+'host'.ljust(colwidth[3])
+            i+=1
+        else:
+            c = c.ljust(colwidth[i])
+        form.append(('underline', c))
+        i+=1
+    print_formatted_text(FormattedText(form))
+
+    for item in agentlist:
+        print_formatted_text(FormattedText([
+            ('#00ff00 bold',item['id'].ljust(colwidth[0])),
+            ('',' | '),
+            ('',item['agent'].ljust(colwidth[1])),
+            ('',' | '),
+            ('#00cccc',item['user'].rjust(colwidth[2])),
+            ('','@'),
+            ('#ffcc00 bold',item['host'].ljust(colwidth[3])),
+            ('',' | '),
+            ('#0000ff',item['date'].ljust(colwidth[4])),
+            ('',' | '),
+            ('#cccccc',item['arch'].ljust(colwidth[5])),
+            ('',' | '),
+            ('',item['os'][:colwidth[6]].ljust(colwidth[6])),
+            ('',' | '),
+            ('',item['desc'][:colwidth[7]].ljust(colwidth[7])),
+        ]))
 
 async def gather_help_info(mythic_instance, cb_id):
     cmd_fields = 'cmd commandparameters { cli_name choices display_name description required default_value ui_position type } description help_cmd supported_ui_features'
@@ -166,8 +222,7 @@ async def print_help(cb_info, cmd):
 class MythicCompleter(Completer):
     def __init__(self, cmds):
         self.cmds = cmds
-    def get_completions(self, document, complete_event):# → AsyncGenerator[Completion, None]
-        #text = document.text_before_cursor
+    def get_completions(self, document, complete_event):
 
         if len(document.text_before_cursor)<1:
             #empty line
@@ -331,6 +386,8 @@ class MythicSuggest(AutoSuggest):
                 lex.extend(map(lambda x: x[1],i))
                 if text.endswith(' '):
                     lex.append('')
+                if not cmd in self.cmds:
+                    return None
                 params = self.cmds[cmd]['commandparameters']
                 n = figure_out_the_current_param(params, lex)
                 if n:
@@ -388,10 +445,11 @@ class MythicLexer(Lexer):
                         elif w.startswith('"'):
                             s = '#0000ff'
                         else:
-                            params = self.cmds[lexarr[0]]['commandparameters']
-                            param_info = figure_out_the_current_param(params, lexarr)
                             s = '#000000'
-                            if param_info:
+                            if lexarr[0] in self.cmds:
+                             params = self.cmds[lexarr[0]]['commandparameters']
+                             param_info = figure_out_the_current_param(params, lexarr)
+                             if param_info:
                                 if param_info['type'] == 'ChooseOne':
                                     if c in param_info['choices']:
                                         s = '#00ff00'
@@ -438,10 +496,11 @@ async def scripting():
         return
 
     if args.callback is None:
-        await select_callback(mythic_instance)
-        args.callback = await PromptSession().prompt_async('cb# ',
+        s = PromptSession()
+        await select_callback(mythic_instance, s.output.get_size().columns)
+        args.callback = int(await s.prompt_async('cb# ',
                     is_password=False,
-                    enable_history_search=False)
+                    enable_history_search=False))
     
     cb_info = await gather_help_info(mythic_instance, args.callback)
 
@@ -485,7 +544,7 @@ async def scripting():
                 cb_info = await gather_help_info(mythic_instance, args.callback)
                 set_title(f"{cb_info['user']}@{cb_info['host']} - {cb_info['payload']['payloadtype']['name']}/{cb_info['os']}")
             else:
-                await select_callback(mythic_instance)
+                await select_callback(mythic_instance, session.output.get_size().columns)
             continue
 
         try:

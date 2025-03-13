@@ -1,7 +1,7 @@
 # Mythic Shell
 A nice little REPL for [Mythic](https://github.com/its-a-feature/Mythic) callbacks.
 
-![Screenshot](./Screenshot.png)
+![Screenshot](./demo.svg)
 
 ## Features
 - File downloads directly to your local box from an agent
