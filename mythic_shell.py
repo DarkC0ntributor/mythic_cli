@@ -9,24 +9,21 @@ from mythic import mythic, mythic_utilities
 from sys import exit, stdin
 from asyncio import get_event_loop, all_tasks, gather, create_task, CancelledError, run, sleep
 from argparse import ArgumentParser
-from os import path, listdir
-from concurrent.futures import ThreadPoolExecutor
+from os import path
 from functools import partial
 from datetime import datetime
 import signal
 from traceback import print_exception
-from shlex import shlex, split as shell_parse
+from shlex import split as shell_parse
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.lexers import Lexer
-from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion #, AutoSuggestFromHistory
-from prompt_toolkit.completion import Completer
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.shortcuts import print_formatted_text, set_title
 from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.validation import Validator
 from uuid import UUID
+from cli_helper import MythicCompleter, MythicParamCompleter, MythicParamSuggest, MythicSuggest, MythicLexer
+from cb_sel import full_sel_cb
 
 def sizeof_fmt(num, suffix="B"):
     for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
@@ -49,73 +46,10 @@ args = parser.parse_args()
 
 histfile = FileHistory(path.expanduser(args.history))
 
-async def select_callback(mythic_instance, columns):
+async def select_callback(mythic_instance, columns, required=False):
     ait = await mythic.get_all_active_callbacks(mythic_instance, "id host user os architecture description payload { payloadtype { name } } last_checkin")
-    agentlist = []
-    colwidth = [0,7,4,4,9,4,2,4]
-    for item in ait:
-        d = datetime.now() - datetime.fromisoformat(item['last_checkin'][:19])
-        if d.total_seconds() < 300:
-            d = f"{d.total_seconds()}s"
-        else:
-            hours, remainder = divmod(d.total_seconds(), 3600)
-            minutes, seconds = divmod(remainder, 60)
-            d = '{}h {}m {}s'.format(int(hours), int(minutes), int(seconds))
-
-        agentlist.append({
-            'id': str(item['id']),
-            'agent': item['payload']['payloadtype']['name'],
-            'user': item['user'],
-            'host': item['host'],
-            'date': d,
-            'arch': item['architecture'],
-            'os': item['os'],
-            'desc': item['description'],
-        })
-        for i,c in enumerate(agentlist[-1].values()):
-            if len(c) > colwidth[i]:
-                colwidth[i] = len(c)
-    w = sum(colwidth)+6*3
-    if w > columns:
-        #make stuff smaller
-        if colwidth[6] > 13:
-            w -= colwidth[6] - 13
-            colwidth[6] = 13
-        if w > columns:
-            colwidth[7] -= 1+w-columns
-
-    form = []
-    i = 0
-    for c in ('#','payload','user@host','Last Seen','arch','os','desc'):
-        if i > 0:
-            form.append(('',' | '))
-        if i==2:
-            c = 'user'.rjust(colwidth[2])+'@'+'host'.ljust(colwidth[3])
-            i+=1
-        else:
-            c = c.ljust(colwidth[i])
-        form.append(('underline', c))
-        i+=1
-    print_formatted_text(FormattedText(form))
-
-    for item in agentlist:
-        print_formatted_text(FormattedText([
-            ('#00ff00 bold',item['id'].ljust(colwidth[0])),
-            ('',' | '),
-            ('',item['agent'].ljust(colwidth[1])),
-            ('',' | '),
-            ('#00cccc',item['user'].rjust(colwidth[2])),
-            ('','@'),
-            ('#ffcc00 bold',item['host'].ljust(colwidth[3])),
-            ('',' | '),
-            ('#0000ff',item['date'].ljust(colwidth[4])),
-            ('',' | '),
-            ('#cccccc',item['arch'].ljust(colwidth[5])),
-            ('',' | '),
-            ('',item['os'][:colwidth[6]].ljust(colwidth[6])),
-            ('',' | '),
-            ('',item['desc'][:colwidth[7]].ljust(colwidth[7])),
-        ]))
+    return await full_sel_cb(ait, columns, required)
+    #return await inline_sel_cb(ait, columns, required)
 
 async def gather_help_info(mythic_instance, cb_id):
     cmd_fields = 'cmd commandparameters { cli_name choices display_name description required default_value ui_position type } description help_cmd supported_ui_features'
@@ -219,264 +153,11 @@ async def print_help(cb_info, cmd):
     
     print("\nUse \"help <cmd>\" for a full help")
 
-class MythicCompleter(Completer):
-    def __init__(self, cmds):
-        self.cmds = cmds
-    def get_completions(self, document, complete_event):
-
-        if len(document.text_before_cursor)<1:
-            #empty line
-            for a in self.cmds.keys():
-                display = self.cmds[a]['cmd']
-                display_meta = self.cmds[a]['description']
-                yield Completion(
-                    text=a,
-                    start_position=0,
-                    display=display,
-                    display_meta=display_meta,
-                )
-
-        lex = list(map(lambda i: i[1], partial_cmd_split(document.text_before_cursor)))
-        if document.text_before_cursor.endswith(' '):
-            lex.append('')
-        #text = document.get_word_before_cursor()
-        if len(lex) < 2:
-            #first word is command
-            t = lex[0] if len(lex)==1 else ''
-            for a in self.cmds.keys():
-                if a.startswith(t):
-                    display = self.cmds[a]['cmd']
-                    display_meta = self.cmds[a]['description']
-                    yield Completion(
-                        text=a,
-                        start_position=-len(t),
-                        display=display,
-                        display_meta=display_meta,
-                    )
-        elif lex[0] in self.cmds:
-            params = self.cmds[lex[0]]['commandparameters']
-            if lex[-1].startswith('-'):
-                #parameter name
-                for pi in params:
-                    if pi["cli_name"].startswith(lex[-1][1:]):
-                        display = pi['display_name']
-                        display_meta = pi['description']
-                        yield Completion(
-                            text=pi["cli_name"]+' ',
-                            start_position=-len(lex[-1][1:]),
-                            display=display,
-                            display_meta=display_meta,
-                        )
-            else:
-                n = figure_out_the_current_param(params, lex)
-                if n:
-                    for c in complete_param(lex[-1], n):
-                        yield c
-
-def figure_out_the_current_param(params: list, lex: list):
-    pos = len(lex)
-    params = sorted(params, key=lambda d: d['ui_position'])
-    n = None
-    if pos > 2 and lex[-2].startswith('-'):
-        #we are in a named parameter
-        for pi in params:
-            if pi["cli_name"] == lex[-1][1:]:
-                n = pi
-                break
-        else:
-            return
-    else:
-        #args count is off if named params are present
-        for p in lex:
-            if p.startswith('-'):
-                pos-=1
-        #we are in param index
-        if len(params) <= pos-2:
-            return
-        n = params[pos-2]
-    return n
-
-def complete_file(text: str):
-    # Start of current file.
-    if text.startswith('~'):
-        text = path.expanduser(text)
-    else:
-        text = './'+text
-    search_dir,prefix = path.split(text)
-    #prefix = path.basename(text)
-
-    # Get all filenames.
-    filenames = []
-    if path.isdir(search_dir):
-        for filename in listdir(search_dir):
-            if filename.startswith(prefix):
-                filenames.append((search_dir, filename))
-
-    # Sort
-    filenames = sorted(filenames, key=lambda k: k[1])
-
-    # Yield them.
-    for directory, filename in filenames:
-        completion = filename[len(prefix) :]
-        full_name = path.join(directory, filename)
-
-        if path.isdir(full_name):
-            filename += "/"
-            completion += "/"
-
-        yield Completion(
-            text=completion,
-            start_position=0,
-            display=filename,
-        )
-
-def complete_param(text, param_info):
-    if param_info['type'] == 'ChooseOne':
-        for c in param_info['choices']:
-            if c.startswith(text):
-                yield Completion(
-                    text=c,
-                    start_position=-len(text)
-                )
-    elif param_info['type'] == 'File':
-        #path
-        for c in complete_file(text):
-            yield c
-    #else:
-    #    yield Completion(
-    #        text='-'+param_info['display_name']+' ',
-    #        start_position=0,
-    #    )
-
-class MythicParamCompleter(Completer):
-    def __init__(self, param_info):
-        self.param_info = param_info
-    def get_completions(self, document, complete_event):
-        text = document.text_before_cursor
-        for c in complete_param(text, self.param_info):
-            yield c
-
-class MythicParamSuggest(AutoSuggest):
-    def __init__(self, param_info):
-        self.param_info = param_info
-    def get_suggestion(self, buff, document):
-        text = document.text_before_cursor
-        for c in complete_param(text, self.param_info):
-            return Suggestion(c.text)
-
-class MythicSuggest(AutoSuggest):
-    def __init__(self, cmds):
-        self.cmds = cmds
-    def get_suggestion(self, buff, document):# → Suggestion | None
-        history = buff.history
-        # Consider only the last line for the suggestion.
-        text = document.text.rsplit("\n", 1)[-1]
-        # Only create a suggestion when this is not an empty line.
-        if text.strip():
-            i = iter(partial_cmd_split(text))
-            (_, cmd, _) = next(i)
-            if len(cmd) < len(text):
-                #cmd is fully typed
-                # Find first matching line in history.
-                for string in reversed(list(history.get_strings())):
-                    for line in reversed(string.splitlines()):
-                        if line.startswith(text):
-                            return Suggestion(line[len(text) :])
-                lex = [cmd]
-                lex.extend(map(lambda x: x[1],i))
-                if text.endswith(' '):
-                    lex.append('')
-                if not cmd in self.cmds:
-                    return None
-                params = self.cmds[cmd]['commandparameters']
-                n = figure_out_the_current_param(params, lex)
-                if n:
-                    for c in complete_param(lex[-1], n):
-                        return Suggestion(c.text)
-            else:
-                for line in self.cmds:
-                    if line.startswith(text):
-                        return Suggestion(line[len(text) :])
-        return None
-
-
-def partial_cmd_split(cmdline):
-    lex = shlex(cmdline, posix=True)
-    lex.whitespace_split = True
-    lex.commenters = ''
-    io = lex.instream
-    while True:
-        try:
-            c = lex.get_token()
-            if c==lex.eof:
-                break
-            yield (True, c, io.tell())
-        except ValueError:
-            c = lex.token
-            yield (False, c, io.tell())
-            break
-
-class MythicLexer(Lexer):
-    def __init__(self, cmds):
-        self.cmds = cmds
-    def lex_document(self, document):
-        lines = document.lines
-
-        def get_line(lineno: int):
-            if lineno==0 and len(lines[0])>0:
-                lex = iter(partial_cmd_split(lines[0]))
-                (_, c, p) = next(lex)
-                ret = []
-                lexarr = [c]
-                s = None
-                if c in self.cmds:
-                    s = '#00ff00'
-                else:
-                    s = '#ff0000'
-                ret.append((s, lines[0][:p]))
-
-                for (ok, c, np) in lex:
-                    lexarr.append(c)
-                    w = lines[0][p:np] # keep the line as it was - quotes etc
-                    p = np
-                    if ok:
-                        if c.startswith('-'):
-                            s = '#ff00ff'
-                        elif w.startswith('"'):
-                            s = '#0000ff'
-                        else:
-                            s = '#000000'
-                            if lexarr[0] in self.cmds:
-                             params = self.cmds[lexarr[0]]['commandparameters']
-                             param_info = figure_out_the_current_param(params, lexarr)
-                             if param_info:
-                                if param_info['type'] == 'ChooseOne':
-                                    if c in param_info['choices']:
-                                        s = '#00ff00'
-                                    else:
-                                        s = '#ff0000'
-                                elif param_info['type'] == 'File':
-                                    c = path.expanduser(c)
-                                    if path.isfile(c):
-                                        s = '#00ff00'
-                                    else:
-                                        s = '#ff0000'
-                                elif param_info['type'] == 'Number':
-                                    try:
-                                        int(c)
-                                        s = '#00ff00'
-                                    except ValueError:
-                                        s = '#ff0000'
-                    else:
-                        s = '#ff0000'
-                    ret.append((s, w))
-                return ret
-            try:
-                return [('', lines[lineno])]
-            except IndexError:
-                return []
-
-        return get_line
+async def switch_cb(mythic_instance):
+    cb_info = await gather_help_info(mythic_instance, args.callback)
+    set_title(f"{cb_info['user']}@{cb_info['host']} - {cb_info['payload']['payloadtype']['name']}/{cb_info['os']}")
+    print_formatted_text(FormattedText([('#00ffff',f"~~ switched to callback #{args.callback} ~~")]))
+    return cb_info
 
 async def scripting():
     mythic_instance = None
@@ -497,21 +178,21 @@ async def scripting():
 
     if args.callback is None:
         s = PromptSession()
-        await select_callback(mythic_instance, s.output.get_size().columns)
-        args.callback = int(await s.prompt_async('cb# ',
-                    is_password=False,
-                    enable_history_search=False))
+        args.callback = await select_callback(mythic_instance, s.output.get_size().columns, required=True)
     
-    cb_info = await gather_help_info(mythic_instance, args.callback)
-
-    set_title(f"{cb_info['user']}@{cb_info['host']} - {cb_info['payload']['payloadtype']['name']}/{cb_info['os']}")
+    cb_info = await switch_cb(mythic_instance)
 
     session = PromptSession(history=histfile)
     while True:
      with patch_stdout():
         cmd = ""
         try:
-            cmd = await session.prompt_async(f"{cb_info['user']}@{cb_info['host']}> ",
+            cmd = await session.prompt_async(FormattedText([                
+                    ('#00cccc',cb_info['user']),
+                    ('','@'),
+                    ('#ffcc00 bold',cb_info['host']),
+                    ('','> ')]),                
+                    #f"{cb_info['user']}@{cb_info['host']}> ",
                     is_password=False,
                     rprompt=f"{cb_info['payload']['payloadtype']['name']}/{cb_info['os']}",
                     lexer=MythicLexer(cb_info['payload']['payloadcommands']),
@@ -541,10 +222,12 @@ async def scripting():
         if cmd[0] == "cb":
             if len(cmd)==2:
                 args.callback = int(cmd[1])
-                cb_info = await gather_help_info(mythic_instance, args.callback)
-                set_title(f"{cb_info['user']}@{cb_info['host']} - {cb_info['payload']['payloadtype']['name']}/{cb_info['os']}")
+                cb_info = await switch_cb(mythic_instance)
             else:
-                await select_callback(mythic_instance, session.output.get_size().columns)
+                c = await select_callback(mythic_instance, session.output.get_size().columns)
+                if c:
+                    args.callback = c
+                    cb_info = await switch_cb(mythic_instance)
             continue
 
         try:
